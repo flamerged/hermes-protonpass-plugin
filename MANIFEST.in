@@ -1,0 +1,3 @@
+include __init__.py
+include plugin.yaml
+recursive-include tests *.py

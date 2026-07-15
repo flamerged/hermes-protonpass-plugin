@@ -1,0 +1,4 @@
+name: protonpass
+version: 0.1.0
+description: Resolve Hermes credentials from Proton Pass.
+kind: standalone

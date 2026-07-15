@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check out Hermes Agent
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install Hermes and plugin
+        run: |
+          uv sync --project hermes-agent --python 3.11 --extra dev
+          uv pip install --python hermes-agent/.venv/bin/python --no-deps -e .
+
+      - name: Lint
+        run: |
+          hermes-agent/.venv/bin/ruff check hermes_protonpass tests
+          hermes-agent/.venv/bin/ruff format --check hermes_protonpass tests
+
+      - name: Test
+        run: hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests" -q
+
+      - name: Build package
+        run: uv build

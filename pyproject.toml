@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77.0,<83"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-protonpass-plugin"
+version = "0.1.0"
+description = "Proton Pass secret-source plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Mersad Ajanovic" }]
+dependencies = [
+  "hermes-agent>=0.18.2,<0.19",
+  "rich==14.3.3",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+protonpass = "hermes_protonpass"
+
+[tool.setuptools.packages.find]
+include = ["hermes_protonpass*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["F811"]
