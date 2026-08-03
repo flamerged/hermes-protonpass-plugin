@@ -631,14 +631,19 @@ def _is_valid_share_or_item_id(value: str) -> bool:
     ``=`` padding.  Real Proton IDs end in ``==`` (e.g.
     ``XhBBMrgq...EO90TRBZFA==``), so the validator MUST accept that padding or
     every real ``pass://SHARE/ITEM/FIELD`` ref is silently skipped.  We reject
-    anything else (whitespace, ``/``, embedded ``=``, empty, over-length) and a
-    leading ``-`` (which would be read as a flag) so a crafted ``pass://`` ref
-    can't smuggle a flag or path into argv.
+    anything else (whitespace, ``/``, embedded ``=``, empty, over-length).
+
+    A leading ``-`` is NOT rejected: base64url IDs legitimately start with
+    ``-`` (it's in the alphabet), and this validator's only caller
+    (``_fetch_refs``) never places ``share_id``/``item_id`` as a standalone
+    argv token — they're only ever embedded inside a single
+    ``f"pass://{share_id}/{item_id}"`` string, which always starts with
+    ``pass://`` and is passed after a ``--`` terminator regardless. Rejecting
+    a leading ``-`` here silently broke every real item whose ID happens to
+    start with it (~1-in-64 IDs) for a flag-injection threat that cannot
+    occur at this call site.
     """
     if not value or len(value) > _MAX_ID_LEN:
-        return False
-    # Leading ``-`` would be misread as a CLI flag — reject up front.
-    if value[0] == "-":
         return False
     # ``re.fullmatch`` anchors at END OF STRING (not before a final ``\n`` the
     # way a trailing ``$`` would), so an id like ``"id\n"`` is REJECTED.
