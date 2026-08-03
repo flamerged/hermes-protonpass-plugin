@@ -88,6 +88,12 @@ hermes protonpass disable
 hermes protonpass install
 ```
 
+## Bundled skill
+
+The plugin registers a read-only `vault-access` skill
+(`skill_view("protonpass:vault-access")`) for finding an item's `share_id`/`item_id`,
+wiring a new `secrets.protonpass.env` mapping, and diagnosing a ref that won't resolve.
+
 ## Development
 
 Run the test suite through a Hermes Agent checkout's canonical runner:

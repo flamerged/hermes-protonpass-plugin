@@ -31,12 +31,16 @@ class RecordingContext:
     def __init__(self) -> None:
         self.secret_sources = []
         self.cli_commands = []
+        self.skills = []
 
     def register_secret_source(self, registered_source) -> None:
         self.secret_sources.append(registered_source)
 
     def register_cli_command(self, **command) -> None:
         self.cli_commands.append(command)
+
+    def register_skill(self, name, path, description="") -> None:
+        self.skills.append((name, path, description))
 
 
 def test_register_uses_public_secret_source_and_cli_surfaces(monkeypatch):
@@ -62,6 +66,10 @@ def test_register_uses_public_secret_source_and_cli_surfaces(monkeypatch):
     assert len(ctx.cli_commands) == 1
     assert ctx.cli_commands[0]["name"] == "protonpass"
     assert reset_calls == [True]
+    assert len(ctx.skills) == 1
+    skill_name, skill_path, _ = ctx.skills[0]
+    assert skill_name == "vault-access"
+    assert skill_path.name == "SKILL.md"
 
 
 def test_registered_cli_builds_plugin_owned_command_tree():
@@ -107,6 +115,27 @@ def test_directory_plugin_loads_through_current_hermes_manager(monkeypatch):
         assert source_registry.get_source("protonpass_vault") is not None
         assert manager._cli_commands["protonpass"]["plugin"] == "protonpass"
         assert reset_calls == [True]
+
+        # The bundled skill registers under the namespaced name and resolves
+        # through the real skill_view() dispatch, not just the raw registry.
+        skill_path = manager.find_plugin_skill("protonpass:vault-access")
+        assert skill_path is not None
+        assert skill_path.name == "SKILL.md"
+        assert skill_path.is_file()
+
+        import json as _json
+
+        from hermes_cli import plugins as plugins_mod
+        from tools.skills_tool import skill_view
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+        result = _json.loads(skill_view("protonpass:vault-access"))
+        assert result["success"] is True
+        assert result["name"] == "protonpass:vault-access"
+        # Read-only framing must survive intact — this is the whole point of
+        # bundling the skill instead of leaving the agent to guess.
+        assert "read-only" in result["content"].lower()
+        assert "never create" in result["content"].lower()
     finally:
         source_registry._reset_registry_for_tests()
 
