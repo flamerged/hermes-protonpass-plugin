@@ -13,8 +13,9 @@ import hashlib
 import logging
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterator, List, Optional
 
 from agent.secret_sources.base import run_secret_cli
 
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 # Timeout for a single pass-cli subprocess, in seconds.
 _PASS_CLI_RUN_TIMEOUT = 30
+
+# How long to block waiting for another Hermes process to finish (re)establishing
+# the shared pass-cli session.  Recovery (logout --force + relogin + info verify)
+# typically takes 3–8s; 45s leaves headroom for a slow Proton API without hanging
+# startup indefinitely on a deadlocked holder.
+_SESSION_LOCK_TIMEOUT = 45.0
 
 # Default reason recorded on every scoped (agent-token) fetch.  Harmless under
 # a full personal session; REQUIRED under scoped agent-token sessions.
@@ -59,6 +66,92 @@ def _session_dir(token: str = "") -> Path:
     return parent / f"protonpass-session-{_token_fingerprint(token)}"
 
 
+def _lock_file_path(token: str) -> Path:
+    """Path to the cross-process lock file inside the isolated session dir.
+
+    A separate ``.lock`` file (rather than locking ``local.key`` itself) keeps
+    the lock state visible and survives any pass-cli rewrite of the key/db.
+    Lives inside the 0o700 session dir, so it inherits the dir's privacy.
+    """
+    return _session_dir(token) / ".lock"
+
+
+@contextmanager
+def _session_lock(token: str) -> Iterator[None]:
+    """Cross-process exclusive lock around pass-cli session (re)establishment.
+
+    pass-cli stores its session material (``local.key``, ``pat_key``,
+    ``session.json``, ``pass-cli.db``) in a SHARED dir keyed by the token
+    fingerprint.  When two Hermes processes (e.g. the always-on gateway and a
+    fresh TUI) both detect an expired session and run ``logout --force`` +
+    ``login`` concurrently, they race on ``local.key`` regeneration: one
+    process's new key invalidates the other's in-flight ``pass-cli.db``, which
+    surfaces as ``Error getting local key`` / ``Error getting item key`` on
+    every subsequent item fetch.
+
+    This lock serializes the (re)establishment critical section across all
+    Hermes processes that share the same token.  Lock is advisory (flock);
+    a non-Hermes pass-cli caller is unaffected.  Acquisition is bounded by
+    ``_SESSION_LOCK_TIMEOUT`` so a crashed holder can't hang startup.
+
+    Raises ``TimeoutError`` only if NO holder releases within the timeout —
+    callers treat that as a session-establishment failure (skip Proton Pass
+    for this cycle, fall back to .env) rather than blocking forever.
+    """
+    session_dir = _session_dir(token)
+    _ensure_private_session_dir(session_dir)
+    lock_path = _lock_file_path(token)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    import fcntl
+
+    deadline = None
+    try:
+        # Try non-blocking first; on failure fall back to a timed wait so we
+        # don't hang forever on a deadlocked holder.  fcntl.flock on macOS
+        # supports LOCK_NB but NOT a timed wait, so we poll with small sleeps.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            import time as _time
+
+            deadline = _time.monotonic() + _SESSION_LOCK_TIMEOUT
+            while True:
+                _time.sleep(0.2)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if _time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "Timed out waiting for another Hermes process to "
+                            "finish Proton Pass session (re)establishment"
+                        )
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _local_key_fingerprint(token: str) -> Optional[str]:
+    """SHA-256 of the current ``local.key`` contents, or None if absent.
+
+    Used to detect that another process has rotated the session key under us
+    between fetch legs.  A change means our cached ``_child_env`` view is stale
+    and the next ``pass-cli`` call may fail with ``Error getting local key`` —
+    callers should re-establish under the session lock before retrying.
+    """
+    key_path = _session_dir(token) / "local.key"
+    try:
+        data = key_path.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
 def _establish_session(token: str, binary: Path) -> List[str]:
     """Establish a non-interactive ``pass-cli`` session from ``token``.
 
@@ -72,21 +165,34 @@ def _establish_session(token: str, binary: Path) -> List[str]:
     (exit 0) verifies it.  On auth failure we do ONE ``pass-cli logout
     --force`` + retry login, then give up.  All invocations share the one
     isolated ``PROTON_PASS_SESSION_DIR`` built by :func:`_child_env`.
+
+    Holds :func:`_session_lock` for the whole (re)establishment so concurrent
+    Hermes processes sharing the same token-fingerprinted session dir cannot
+    race on ``local.key`` regeneration (which would otherwise corrupt the
+    shared ``pass-cli.db`` and surface as ``Error getting local key`` on every
+    item fetch).  A ``TimeoutError`` from the lock propagates as a RuntimeError
+    so the caller skips Proton Pass for this cycle rather than blocking.
     """
     env = _child_env(token)
     warnings: List[str] = []
 
-    # login → info, with one logout --force + relogin recovery on failure.
-    ok, _ = _try_login_and_verify(binary, env)
-    if ok:
-        return warnings
+    try:
+        with _session_lock(token):
+            # login → info, with one logout --force + relogin recovery on failure.
+            ok, _ = _try_login_and_verify(binary, env)
+            if ok:
+                return warnings
 
-    # Recovery: clear any stale session in our isolated dir and retry once.
-    _run_pass_cli([str(binary), "logout", "--force"], env)
-    ok, login_err = _try_login_and_verify(binary, env)
-    if ok:
-        warnings.append("pass-cli session recovered after a logout/relogin retry")
-        return warnings
+            # Recovery: clear any stale session in our isolated dir and retry once.
+            _run_pass_cli([str(binary), "logout", "--force"], env)
+            ok, login_err = _try_login_and_verify(binary, env)
+            if ok:
+                warnings.append(
+                    "pass-cli session recovered after a logout/relogin retry"
+                )
+                return warnings
+    except TimeoutError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     # Surface the (redacted, ANSI-stripped) login stderr to aid debugging.  The
     # token is scrubbed defensively even though it should never appear here.
@@ -98,6 +204,19 @@ def _establish_session(token: str, binary: Path) -> List[str]:
     if detail:
         message = f"{message}: {detail}"
     raise RuntimeError(message)
+
+
+def _verify_session_alive(token: str, binary: Path) -> bool:
+    """Cheap liveness check: does the shared session still answer ``info``?
+
+    Called between fetch legs to detect that another process rotated
+    ``local.key`` under us.  Runs under no lock (it's a read-only probe); if it
+    reports False, the caller re-enters :func:`_establish_session` which WILL
+    take the lock and recover serially.
+    """
+    env = _child_env(token)
+    info = _run_pass_cli([str(binary), "info"], env)
+    return info is not None and info.returncode == 0
 
 
 def _try_login_and_verify(binary: Path, env: Dict[str, str]):

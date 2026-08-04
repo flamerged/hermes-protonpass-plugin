@@ -39,8 +39,10 @@ from .session import (
     _child_env,
     _clean_stream,
     _establish_session,
+    _local_key_fingerprint,
     _redact_token,
     _run_pass_cli,
+    _verify_session_alive,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,74 @@ def _cli_error_detail(proc, token: str, *, limit: int = 200) -> str:
     """
     err = _redact_token(_clean_stream(proc.stderr or ""), token).strip()
     return err[:limit] if err else "(no stderr output)"
+
+
+# Substrings in pass-cli stderr that indicate the shared session was lost or
+# corrupted out from under us — typically because another Hermes process
+# rotated ``local.key`` between our ``_establish_session`` and this fetch.
+# When one of these appears, a re-establishment under the session lock + a
+# single retry is the correct recovery; treating it as a permanent skip would
+# cascade into every ref failing on the same race.
+_SESSION_CORRUPTION_MARKERS = (
+    "there is no session",
+    "Error getting local key",
+    "Error getting item key",
+    "Error serializing auth",
+    "requires an authenticated client",
+    "Error getting ope",
+)
+
+
+def _looks_like_session_corruption(proc) -> bool:
+    """True if the failed pass-cli call's stderr points at a lost/corrupted session.
+
+    Used to decide between a permanent skip (malformed ref, real auth failure)
+    and a single retry after re-establishing the session under the cross-process
+    lock.  Reads ONLY stderr (never stdout — see :func:`_cli_error_detail`).
+    """
+    if proc is None:
+        # Transport failure (timeout/OSError) — not a session race, don't retry.
+        return False
+    if proc.returncode == 0:
+        return False
+    err = _clean_stream(proc.stderr or "").lower()
+    return any(m.lower() in err for m in _SESSION_CORRUPTION_MARKERS)
+
+
+def _run_with_session_recovery(
+    cmd: List[str],
+    token: str,
+    binary: Path,
+    env: Dict[str, str],
+):
+    """Run a pass-cli ``cmd``; on session-corruption, re-establish and retry once.
+
+    Detects the race where another Hermes process rotated ``local.key`` in the
+    shared session dir between our ``_establish_session`` and this call.  In
+    that case the first call fails with ``Error getting local key`` / ``there
+    is no session``; we re-enter :func:`_establish_session` (which takes the
+    cross-process lock, so a third concurrent process also waits) and retry
+    the SAME command exactly once.  A second failure is returned as-is and
+    the caller records a transient warning.
+
+    Returns the CompletedProcess (which may still be non-zero on the second
+    try) or None on transport failure.
+    """
+    proc = _run_pass_cli(cmd, env)
+    if proc is not None and proc.returncode == 0:
+        return proc
+    if not _looks_like_session_corruption(proc):
+        return proc
+    # Session rotated under us: re-establish under the cross-process lock.
+    # Any warning from recovery is informational; the caller's own warning
+    # (on a second failure) is what surfaces to the user.
+    try:
+        _establish_session(token, binary)
+    except RuntimeError:
+        # Recovery failed; return the original failed proc so the caller
+        # records its own diagnostic.  Don't shadow the original error.
+        return proc
+    return _run_pass_cli(cmd, env)
 
 
 def _drop_bootstrap(
@@ -342,7 +412,7 @@ def _fetch_refs(
             "--",
             item_uri,
         ]
-        proc = _run_pass_cli(cmd, env)
+        proc = _run_with_session_recovery(cmd, token, binary, env)
         if proc is None:
             warnings.append(
                 f"Skipping ref {env_name!r}: pass-cli timed out or failed to invoke"
@@ -453,7 +523,7 @@ def _fetch_vault(
         vault,
     ]
     env = _child_env(token)
-    proc = _run_pass_cli(cmd, env)
+    proc = _run_with_session_recovery(cmd, token, binary, env)
     if proc is None:
         return _FetchResult(
             {},
