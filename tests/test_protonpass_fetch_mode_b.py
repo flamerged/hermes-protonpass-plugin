@@ -50,7 +50,7 @@ def test_mode_b_refs_raw_value(hermes_home, monkeypatch, tmp_path):
         verb = cmd[1]
         if verb in ("login", "info"):
             return _ok()
-        if verb == "item":  # item view --field
+        if verb == "item":  # item view -- pass://SHARE/ITEM/FIELD
             captured.append(cmd)
             return mock.Mock(returncode=0, stdout="sk-raw-value\n", stderr="")
         return _ok()
@@ -68,17 +68,20 @@ def test_mode_b_refs_raw_value(hermes_home, monkeypatch, tmp_path):
     assert warnings == []
     view_cmd = captured[0]
     assert "view" in view_cmd
-    assert "pass://SHARE/ITEM" in view_cmd
-    assert "--field" in view_cmd
-    assert view_cmd[view_cmd.index("--field") + 1] == "api_key"
+    # V-FIELDFLAG (regression): the field must be embedded as the URI's
+    # third segment, NOT passed via a separate --field flag — pass-cli
+    # 2.1.1 silently ignores --field combined with a two-segment URI and
+    # dumps the whole item instead of the field value.
+    assert "pass://SHARE/ITEM/api_key" in view_cmd
+    assert "--field" not in view_cmd
 
 
 def test_mode_b_nonzero_exit_with_secret_stdout_does_not_leak(
     hermes_home, monkeypatch, tmp_path
 ):
-    """SECURITY regression: ``item view --field`` writes the bare SECRET to
-    stdout, so a non-zero exit AFTER stdout was written must NOT leak it into
-    the skip warning.  With empty stderr, only the exit code + a generic marker
+    """SECURITY regression: ``item view`` writes the bare SECRET to stdout,
+    so a non-zero exit AFTER stdout was written must NOT leak it into the
+    skip warning.  With empty stderr, only the exit code + a generic marker
     surface — never the captured stdout value."""
     binary = tmp_path / "pass-cli"
     binary.write_text("", encoding="utf-8")
@@ -88,7 +91,7 @@ def test_mode_b_nonzero_exit_with_secret_stdout_does_not_leak(
         verb = cmd[1]
         if verb in ("login", "info"):
             return _ok()
-        if verb == "item":  # item view --field — secret on stdout, then fail
+        if verb == "item":  # item view -- pass://...FIELD — secret on stdout, then fail
             return mock.Mock(returncode=1, stdout=leaked + "\n", stderr="")
         return _ok()
 
@@ -199,7 +202,7 @@ def test_mode_b_empty_value_partial_is_not_cached(hermes_home, monkeypatch, tmp_
         if verb in ("login", "info"):
             return _ok()
         if verb == "item":
-            field = cmd[cmd.index("--field") + 1]
+            field = cmd[-1].rsplit("/", 1)[-1]
             # GOOD resolves; EMPTY returns rc=0 with empty stdout.
             return mock.Mock(
                 returncode=0,
@@ -241,7 +244,7 @@ def test_mode_b_failed_ref_is_retried_on_next_fetch(hermes_home, monkeypatch, tm
         if verb in ("login", "info"):
             return _ok()
         if verb == "item":
-            field = cmd[cmd.index("--field") + 1]
+            field = cmd[-1].rsplit("/", 1)[-1]
             if field == "good":
                 return mock.Mock(returncode=0, stdout="g\n", stderr="")
             # BAD: fail transiently the first time, succeed thereafter.
@@ -538,6 +541,39 @@ def test_mode_b_overrides_mode_a_on_collision(hermes_home, monkeypatch, tmp_path
     assert secrets["PROBE_LOGIN_PASSWORD"] == "from-ref"
 
 
+def test_mode_b_never_passes_field_as_separate_flag(hermes_home, monkeypatch, tmp_path):
+    """V-FIELDFLAG (regression): pass-cli 2.1.1 silently ignores a field
+    passed via ``--field <FIELD> -- pass://SHARE/ITEM`` (two-segment URI)
+    and dumps the whole item to stdout instead — verified against a live
+    vault, reproducible on every call, for both hidden and text fields.
+    The fix embeds FIELD as the URI's third segment instead. This test
+    pins that shape so a future change can't silently regress to the
+    broken form."""
+    binary = tmp_path / "pass-cli"
+    binary.write_text("", encoding="utf-8")
+    captured = []
+
+    def fake_run(cmd, env):
+        verb = cmd[1]
+        if verb in ("login", "info"):
+            return _ok()
+        captured.append(cmd)
+        return mock.Mock(returncode=0, stdout="val\n", stderr="")
+
+    _patch_run(monkeypatch, fake_run)
+
+    pp.fetch_protonpass_secrets(
+        service_token="svc",
+        env_refs={"K": "pass://SHARE/ITEM/My Field"},
+        binary=binary,
+        use_cache=False,
+        home_path=hermes_home,
+    )
+    cmd = captured[0]
+    assert "--field" not in cmd
+    assert cmd[-1] == "pass://SHARE/ITEM/My Field"
+
+
 def test_mode_b_uses_double_dash_separator(hermes_home, monkeypatch, tmp_path):
     """A valid MODE B ref builds argv with `--` before the positional URI and
     without `--output json`."""
@@ -564,7 +600,7 @@ def test_mode_b_uses_double_dash_separator(hermes_home, monkeypatch, tmp_path):
     cmd = captured[0]
     assert "--" in cmd
     assert "--output" not in cmd
-    assert cmd.index("--") < cmd.index("pass://SHARE/ITEM")
+    assert cmd.index("--") < cmd.index("pass://SHARE/ITEM/field")
 
 
 # ---------------------------------------------------------------------------
@@ -867,4 +903,4 @@ def test_mode_b_resolves_real_padded_ids(hermes_home, monkeypatch, tmp_path):
     assert warnings == []
     # The padded IDs survived validation and reached the positional URI.
     view_cmd = captured[0]
-    assert f"pass://{share}/{item}" in view_cmd
+    assert f"pass://{share}/{item}/api_key" in view_cmd

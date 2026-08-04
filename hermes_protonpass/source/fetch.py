@@ -78,7 +78,7 @@ class _FetchResult:
 def _cli_error_detail(proc, token: str, *, limit: int = 200) -> str:
     """Build a redacted, diagnostic-safe error string from a failed pass-cli call.
 
-    SECURITY: ``stdout`` is NEVER read here.  ``pass-cli item view --field``
+    SECURITY: ``stdout`` is NEVER read here.  ``pass-cli item view`` (MODE B)
     writes the bare SECRET VALUE to stdout, and ``item list --show-secrets``
     writes secret JSON to stdout — so a command that emitted the secret and THEN
     exited non-zero would leak it straight into a warning if stdout were
@@ -272,21 +272,35 @@ def _fetch_refs(
 ) -> _FetchResult:
     """MODE B: resolve each ``ENV_VAR -> pass://...`` ref to a single value.
 
-    Confirmed (pass-cli 2.1.1): the config ref is
-    ``pass://SHARE_ID/ITEM_ID/FIELD``.  IDs are base64url (no ``/``), so we
-    split on ``/`` into exactly ``[share_id, item_id, field]``.  The ref MUST
-    carry the ``pass://`` scheme and resolve to exactly three non-empty
-    components; a non-``pass://`` URI, a missing FIELD, or an over-long ref
-    (``.../F/extra``) is skipped with a warning naming the expected shape.  The
-    IDs are validated as base64url and a flag-like FIELD is rejected
-    (argument-injection defence).  The value is fetched with::
+    The config ref is ``pass://SHARE_ID/ITEM_ID/FIELD``.  IDs are base64url
+    (no ``/``), so we split on ``/`` into exactly ``[share_id, item_id,
+    field]``.  The ref MUST carry the ``pass://`` scheme and resolve to
+    exactly three non-empty components; a non-``pass://`` URI, a missing
+    FIELD, or an over-long ref (``.../F/extra``) is skipped with a warning
+    naming the expected shape.  The IDs are validated as base64url and a
+    flag-like FIELD is rejected (argument-injection defence).  The value is
+    fetched with::
 
-        pass-cli item view --field <FIELD> -- "pass://SHARE_ID/ITEM_ID"
+        pass-cli item view -- "pass://SHARE_ID/ITEM_ID/FIELD"
 
-    and read as the RAW value from stdout (``--field`` returns the bare value,
-    NOT JSON, so we do NOT json-parse this path), trailing newline stripped.
-    The ``--`` terminates option parsing so the positional URI can't be read as
-    a flag.
+    i.e. the field is embedded as the URI's third segment, NOT passed via a
+    separate ``--field`` flag.
+
+    VERIFIED BUG (pass-cli 2.1.1, build 6c9e81c): ``item view --field
+    <FIELD> -- "pass://SHARE_ID/ITEM_ID"`` (field as a flag, two-segment
+    URI) silently ignores ``--field`` and dumps the ENTIRE item's
+    human-readable text representation to stdout instead of erroring or
+    returning the field value — for every field type (hidden and text
+    alike), reproducible on every call. The two-flag/three-segment form
+    used here does not exhibit this: confirmed byte-for-byte against
+    ``item view --vault-name ... --item-title ... --field ...`` (which is
+    unaffected) across both hidden and text fields. Do not reintroduce
+    ``--field`` for this call site without re-verifying against whatever
+    pass-cli version is pinned at the time.
+
+    Read as the RAW value from stdout (not JSON, so we do NOT json-parse
+    this path), trailing newline stripped.  The ``--`` terminates option
+    parsing so the positional URI can't be read as a flag.
     """
     secrets: Dict[str, str] = {}
     warnings: List[str] = []
@@ -329,16 +343,16 @@ def _fetch_refs(
                 "(starts with '-')"
             )
             continue
-        item_uri = f"pass://{share_id}/{item_id}"
-        # ``--`` terminates option parsing so the positional pass:// URI and the
-        # field value can't be misinterpreted as flags.  ``--field`` returns the
-        # bare value (NOT JSON), so we do not pass ``--output json`` here.
+        # Field embedded as the URI's third segment — see the VERIFIED BUG
+        # note above for why a separate --field flag is not used here.
+        item_uri = f"pass://{share_id}/{item_id}/{field_name}"
+        # ``--`` terminates option parsing so the positional pass:// URI
+        # can't be misinterpreted as a flag.  The bare value (NOT JSON)
+        # comes back on stdout, so we do not pass ``--output json`` here.
         cmd = [
             str(binary),
             "item",
             "view",
-            "--field",
-            field_name,
             "--",
             item_uri,
         ]
@@ -351,7 +365,7 @@ def _fetch_refs(
             continue
 
         if proc.returncode != 0:
-            # SECURITY: never surface stdout here — ``item view --field`` writes
+            # SECURITY: never surface stdout here — ``item view`` writes
             # the bare secret to stdout, so a non-zero exit AFTER stdout was
             # written would leak it.  Only stderr is diagnostic-safe.  The URI
             # also contains ids the user may consider sensitive, so we keep the
@@ -363,7 +377,7 @@ def _fetch_refs(
             transient_failures += 1
             continue
 
-        # --field emits the bare value on stdout (NOT JSON).  Strip EXACTLY ONE
+        # item view emits the bare value on stdout (NOT JSON).  Strip EXACTLY ONE
         # trailing line terminator the CLI appends — never ``.rstrip("\r\n")``
         # (which would eat EVERY trailing CR/LF and corrupt a secret that itself
         # ends in a newline: pass-cli appends one terminator, so a value ending
