@@ -34,7 +34,7 @@ jobs:
           hermes-agent/.venv/bin/ruff format --check hermes_protonpass tests
 
       - name: Test
-        run: hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests" -q
+        run: hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests"
 
       - name: Build package
         run: uv build
