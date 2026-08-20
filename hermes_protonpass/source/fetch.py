@@ -67,7 +67,8 @@ class _FetchResult:
     failed or empty ref, a glitched vault list.  A non-zero count means the
     result is partial/transient and must NOT be cached, so the failed piece is
     retried before the TTL rather than frozen for it.  Permanent validation
-    skips (malformed ref, flag-like name) only add warnings and are NOT counted.
+    skips (malformed ref, flag-like vault name) only add warnings and are NOT
+    counted.
     """
 
     secrets: Dict[str, str]
@@ -277,9 +278,8 @@ def _fetch_refs(
     field]``.  The ref MUST carry the ``pass://`` scheme and resolve to
     exactly three non-empty components; a non-``pass://`` URI, a missing
     FIELD, or an over-long ref (``.../F/extra``) is skipped with a warning
-    naming the expected shape.  The IDs are validated as base64url and a
-    flag-like FIELD is rejected (argument-injection defence).  The value is
-    fetched with::
+    naming the expected shape.  The IDs are validated as base64url.  The value
+    is fetched with::
 
         pass-cli item view -- "pass://SHARE_ID/ITEM_ID/FIELD"
 
@@ -291,8 +291,8 @@ def _fetch_refs(
     URI) silently ignores ``--field`` and dumps the ENTIRE item's
     human-readable text representation to stdout instead of erroring or
     returning the field value — for every field type (hidden and text
-    alike), reproducible on every call. The two-flag/three-segment form
-    used here does not exhibit this: confirmed byte-for-byte against
+    alike), reproducible on every call. The three-segment URI form used here
+    does not exhibit this: confirmed byte-for-byte against
     ``item view --vault-name ... --item-title ... --field ...`` (which is
     unaffected) across both hidden and text fields. Do not reintroduce
     ``--field`` for this call site without re-verifying against whatever
@@ -326,21 +326,15 @@ def _fetch_refs(
             )
             continue
         share_id, item_id, field_name = parsed
-        # Argument-injection defence: validate the IDs as base64url and reject
-        # a field name that would be read as a flag.  Both go into argv, so a
-        # value like "--show-secrets" or "-x" must never slip through.
+        # Validate IDs as base64url before embedding them in the URI.  The field
+        # is part of the same URI token after ``--``, so a leading dash in the
+        # field name cannot be interpreted as an option.
         if not _is_valid_share_or_item_id(share_id) or not _is_valid_share_or_item_id(
             item_id
         ):
             warnings.append(
                 f"Skipping ref {env_name!r}: SHARE_ID/ITEM_ID are not valid "
                 "base64url identifiers"
-            )
-            continue
-        if _is_flag_like(field_name):
-            warnings.append(
-                f"Skipping ref {env_name!r}: FIELD name looks like a flag "
-                "(starts with '-')"
             )
             continue
         # Field embedded as the URI's third segment — see the VERIFIED BUG

@@ -662,15 +662,19 @@ def test_mode_a_flag_like_vault_rejected(hermes_home, monkeypatch, tmp_path):
     assert "flag" in warnings[0]
 
 
-def test_mode_b_flag_like_field_rejected(hermes_home, monkeypatch, tmp_path):
+def test_mode_b_leading_dash_field_stays_inside_uri(hermes_home, monkeypatch, tmp_path):
     binary = tmp_path / "pass-cli"
     binary.write_text("", encoding="utf-8")
+    captured = []
 
     def fake_run(cmd, env):
         verb = cmd[1]
         if verb in ("login", "info"):
             return _ok()
-        raise AssertionError("item view must not run for a flag-like FIELD")
+        if verb == "item":
+            captured.append(cmd)
+            return mock.Mock(returncode=0, stdout="value\n", stderr="")
+        raise AssertionError(f"unexpected verb: {verb!r}")
 
     _patch_run(monkeypatch, fake_run)
 
@@ -681,8 +685,10 @@ def test_mode_b_flag_like_field_rejected(hermes_home, monkeypatch, tmp_path):
         use_cache=False,
         home_path=hermes_home,
     )
-    assert secrets == {}
-    assert any("flag" in w for w in warnings)
+    assert secrets == {"K": "value"}
+    assert warnings == []
+    assert captured[0][-1] == "pass://SHARE/ITEM/--evil"
+    assert captured[0][-2] == "--"
 
 
 def test_mode_b_invalid_share_id_rejected(hermes_home, monkeypatch, tmp_path):
