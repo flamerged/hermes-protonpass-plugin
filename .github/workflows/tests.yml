@@ -18,6 +18,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: NousResearch/hermes-agent
+          # v2026.7.7.2 / package release 0.18.2, within our declared support range.
+          ref: 9de9c25f620ff7f1ce0fd5457d596052d5159596
           path: hermes-agent
 
       - name: Set up uv
@@ -25,8 +27,9 @@ jobs:
 
       - name: Install Hermes and plugin
         run: |
-          uv sync --project hermes-agent --python 3.11 --extra dev
+          uv sync --project hermes-agent --locked --python 3.11 --extra dev
           uv pip install --python hermes-agent/.venv/bin/python --no-deps -e .
+          uv pip check --python hermes-agent/.venv/bin/python
 
       - name: Lint
         run: |
@@ -38,3 +41,34 @@ jobs:
 
       - name: Build package
         run: uv build
+
+  upstream-compatibility:
+    # Observe upstream changes without silently expanding our supported range.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check out upstream Hermes Agent
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: hermes-agent
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install upstream Hermes and plugin
+        run: |
+          uv sync --project hermes-agent --locked --python 3.11 --extra dev
+          uv pip install --python hermes-agent/.venv/bin/python --no-deps -e .
+
+      - name: Report upstream version and revision
+        run: |
+          hermes-agent/.venv/bin/python -c "from importlib.metadata import version; print('Advisory upstream Hermes version:', version('hermes-agent'))"
+          git -C hermes-agent rev-parse HEAD
+
+      - name: Check upstream compatibility (advisory)
+        run: hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests"
