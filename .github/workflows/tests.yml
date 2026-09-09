@@ -88,4 +88,13 @@ jobs:
           uv pip install --python .venv/Scripts/python.exe pytest==8.3.5
 
       - name: Test native Windows session locking
-        run: .venv/Scripts/python.exe -m pytest tests/test_protonpass_locking.py
+        shell: pwsh
+        run: |
+          # Keep pytest outside the directory-install shim's package tree.
+          $lockTestPython = (Resolve-Path .venv/Scripts/python.exe).Path
+          $lockTestRoot = Join-Path $env:RUNNER_TEMP ("protonpass-lock-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path "$lockTestRoot/tests", "$lockTestRoot/hermes_protonpass/source" -Force | Out-Null
+          Copy-Item tests/test_protonpass_locking.py "$lockTestRoot/tests/test_protonpass_locking.py"
+          Copy-Item hermes_protonpass/source/locking.py "$lockTestRoot/hermes_protonpass/source/locking.py"
+          Set-Location $lockTestRoot
+          & $lockTestPython -m pytest tests/test_protonpass_locking.py
