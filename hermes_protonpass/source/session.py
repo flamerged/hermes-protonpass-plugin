@@ -13,17 +13,24 @@ import hashlib
 import logging
 import os
 import re
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterator, List
 
 from agent.secret_sources.base import run_secret_cli
 
 from .install import _hermes_bin_dir
+from .locking import exclusive_file_lock
 
 logger = logging.getLogger(__name__)
 
 # Timeout for a single pass-cli subprocess, in seconds.
 _PASS_CLI_RUN_TIMEOUT = 30
+
+# Acquisition only; below Hermes' default 120 s fetch budget. CLI commands
+# retain their own subprocess timeout while the transaction owns the lock.
+_SESSION_LOCK_TIMEOUT = 30.0
 
 # Default reason recorded on every scoped (agent-token) fetch.  Harmless under
 # a full personal session; REQUIRED under scoped agent-token sessions.
@@ -59,7 +66,35 @@ def _session_dir(token: str = "") -> Path:
     return parent / f"protonpass-session-{_token_fingerprint(token)}"
 
 
-def _establish_session(token: str, binary: Path) -> List[str]:
+@contextmanager
+def _session_lock(token: str) -> Iterator[None]:
+    """Own the complete establish/fetch/recovery transaction for this token.
+
+    pass-cli 2.1.1 appends ``.session`` to PROTON_PASS_SESSION_DIR and deletes
+    only that child during cleanup. The sibling ``.lock`` survives logout.
+    """
+    root = _session_dir(token)
+    _ensure_private_session_dir(root)
+    with exclusive_file_lock(root / ".lock", timeout=_SESSION_LOCK_TIMEOUT):
+        yield
+
+
+@dataclass
+class _SessionRecovery:
+    """One logout/relogin allowance shared by establishment and all fetch legs."""
+
+    used: bool = False
+
+    def claim(self) -> bool:
+        if self.used:
+            return False
+        self.used = True
+        return True
+
+
+def _establish_session(
+    token: str, binary: Path, *, recovery: _SessionRecovery | None = None
+) -> List[str]:
     """Establish a non-interactive ``pass-cli`` session from ``token``.
 
     Returns a list of non-fatal warnings; raises :class:`RuntimeError` on a
@@ -70,23 +105,27 @@ def _establish_session(token: str, binary: Path) -> List[str]:
     ``PROTON_PASS_PERSONAL_ACCESS_TOKEN`` in the child env, ``pass-cli login``
     establishes the session non-interactively from it, and ``pass-cli info``
     (exit 0) verifies it.  On auth failure we do ONE ``pass-cli logout
-    --force`` + retry login, then give up.  All invocations share the one
+    --force`` + retry login, then give up. The transaction owner supplies the
+    shared recovery allowance and holds :func:`_session_lock`; this helper
+    never acquires a nested lock. All invocations share the one
     isolated ``PROTON_PASS_SESSION_DIR`` built by :func:`_child_env`.
     """
     env = _child_env(token)
     warnings: List[str] = []
+    recovery = recovery if recovery is not None else _SessionRecovery()
 
     # login → info, with one logout --force + relogin recovery on failure.
-    ok, _ = _try_login_and_verify(binary, env)
+    ok, login_err = _try_login_and_verify(binary, env)
     if ok:
         return warnings
 
     # Recovery: clear any stale session in our isolated dir and retry once.
-    _run_pass_cli([str(binary), "logout", "--force"], env)
-    ok, login_err = _try_login_and_verify(binary, env)
-    if ok:
-        warnings.append("pass-cli session recovered after a logout/relogin retry")
-        return warnings
+    if recovery.claim():
+        _run_pass_cli([str(binary), "logout", "--force"], env)
+        ok, login_err = _try_login_and_verify(binary, env)
+        if ok:
+            warnings.append("pass-cli session recovered after a logout/relogin retry")
+            return warnings
 
     # Surface the (redacted, ANSI-stripped) login stderr to aid debugging.  The
     # token is scrubbed defensively even though it should never appear here.
