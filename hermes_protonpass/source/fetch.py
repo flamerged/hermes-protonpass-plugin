@@ -51,8 +51,8 @@ _MAX_ID_LEN = 256
 
 # A plausible Proton share/item ID: ASCII base64url body with OPTIONAL trailing
 # ``=`` padding (real probe IDs end in ``==``, e.g. ``XhBBMrgq...EO90TRBZFA==``).
-# Anchored with ``re.fullmatch`` so a ``/``, whitespace, leading ``-``, internal
-# ``=``, or a TRAILING NEWLINE can't slip a flag/path into argv.  (A trailing
+# Anchored with ``re.fullmatch`` to reject ``/``, whitespace, internal ``=``,
+# and a TRAILING NEWLINE. A leading ``-`` is valid inside a URI segment. (A trailing
 # ``$`` would have matched before a final ``\n``, so the previous ``^...$``
 # anchoring wrongly accepted ``id\n``.)  Length is bounded separately by
 # ``_MAX_ID_LEN``.
@@ -645,7 +645,7 @@ def _is_valid_share_or_item_id(value: str) -> bool:
     ``-`` (it's in the alphabet), and this validator's only caller
     (``_fetch_refs``) never places ``share_id``/``item_id`` as a standalone
     argv token — they're only ever embedded inside a single
-    ``f"pass://{share_id}/{item_id}"`` string, which always starts with
+    ``f"pass://{share_id}/{item_id}/{field_name}"`` string, which starts with
     ``pass://`` and is passed after a ``--`` terminator regardless. Rejecting
     a leading ``-`` here silently broke every real item whose ID happens to
     start with it (~1-in-64 IDs) for a flag-injection threat that cannot
