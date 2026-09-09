@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from .cli import register_protonpass_cli
 from .source import ProtonPassSource, ProtonPassVaultSource
 
 __all__ = ["ProtonPassSource", "ProtonPassVaultSource", "register"]
+
+logger = logging.getLogger(__name__)
 
 
 def register(ctx) -> None:
@@ -21,11 +24,16 @@ def register(ctx) -> None:
         setup_fn=register_protonpass_cli,
     )
 
-    skills_dir = Path(__file__).parent.parent / "skills"
-    for child in sorted(skills_dir.iterdir()):
-        skill_md = child / "SKILL.md"
-        if child.is_dir() and skill_md.exists():
-            ctx.register_skill(child.name, skill_md)
+    skill_md = Path(__file__).parent / "skills" / "vault-access" / "SKILL.md"
+    if skill_md.is_file():
+        ctx.register_skill("vault-access", skill_md)
+    else:
+        # Optional guidance must not disable credential resolution or the CLI
+        # when an installation is incomplete. Never scan sibling packages.
+        logger.warning(
+            "Bundled vault-access skill is missing; reinstall "
+            "hermes-protonpass-plugin to restore it."
+        )
 
     # Hermes loads .env before general plugin discovery. Invalidate the
     # once-per-process guard so the next normal env load includes this newly

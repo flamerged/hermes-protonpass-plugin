@@ -22,6 +22,9 @@ protonpass = "hermes_protonpass"
 [tool.setuptools.packages.find]
 include = ["hermes_protonpass*"]
 
+[tool.setuptools.package-data]
+hermes_protonpass = ["skills/*/SKILL.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
