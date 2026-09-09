@@ -64,6 +64,11 @@ Then validate through the plugin-owned CLI in the same Hermes home/profile:
 hermes protonpass sync
 ```
 
+If `sync` reports that the integration is disabled, have the user re-run
+`hermes protonpass setup` in their own terminal after saving the references. Setup
+enables the mapped source once refs exist; then retry `sync` in the same Hermes
+home/profile.
+
 `sync` fetches the configured references and reports a dry-run application plan without
 printing values. Look for `would export`, or `skip (already set)` when
 `override_existing` is off and the variable is already in the process environment.
@@ -77,8 +82,10 @@ hermes protonpass status
 ```
 
 Reports whether the sources are enabled, how many refs are configured, and which
-verified `pass-cli` binary is available. If authentication is missing or expired,
-have the user repair it through `hermes protonpass setup` in their own terminal.
+verified `pass-cli` binary is available. If the mapped source is disabled, have the user
+re-run `hermes protonpass setup` in their own terminal after adding the references;
+setup enables the mapped source once refs exist. If authentication is missing or
+expired, have the user repair it through setup in their own terminal.
 
 ## Guardrails
 
