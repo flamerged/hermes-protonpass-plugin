@@ -13,10 +13,13 @@ jobs:
     steps:
       - name: Check out plugin
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Check out Hermes Agent
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
           repository: NousResearch/hermes-agent
           # v2026.7.7.2 / package release 0.18.2, within our declared support range.
           ref: 9de9c25f620ff7f1ce0fd5457d596052d5159596
@@ -49,10 +52,13 @@ jobs:
     steps:
       - name: Check out plugin
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Check out upstream Hermes Agent
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
           repository: NousResearch/hermes-agent
           ref: main
           path: hermes-agent
