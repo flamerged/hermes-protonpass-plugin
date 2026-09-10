@@ -703,15 +703,66 @@ def test_mode_b_invalid_share_id_rejected(hermes_home, monkeypatch, tmp_path):
 
     _patch_run(monkeypatch, fake_run)
 
+    # A leading '-' is now a VALID base64url ID byte (see test_is_valid_
+    # share_or_item_id's V-DASH regression case) — this exercises the
+    # character-class rejection instead (embedded space is not base64url).
     secrets, warnings = pp.fetch_protonpass_secrets(
         service_token="svc",
-        env_refs={"K": "pass://-bad/ITEM/field"},
+        env_refs={"K": "pass://ba d/ITEM/field"},
         binary=binary,
         use_cache=False,
         home_path=hermes_home,
     )
     assert secrets == {}
     assert any("base64url" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    ("share_id", "item_id"),
+    [
+        ("-SHARE", "ITEM"),
+        ("SHARE", "-ITEM"),
+        ("-SHARE", "-ITEM"),
+        ("-SHARE==", "-ITEM=="),
+    ],
+)
+def test_mode_b_leading_dash_share_and_item_id_accepted(
+    hermes_home, monkeypatch, tmp_path, share_id, item_id
+):
+    """V-DASH: real Proton IDs starting with '-' must resolve, not be skipped.
+
+    share_id/item_id are only ever embedded inside a single
+    f"pass://{share_id}/{item_id}/{field}" argv token placed after "--", so a
+    leading '-' inside either ID can't be misread as a flag.
+    """
+    binary = tmp_path / "pass-cli"
+    binary.write_text("", encoding="utf-8")
+
+    captured = []
+
+    def fake_run(cmd, env):
+        verb = cmd[1]
+        if verb in ("login", "info"):
+            return _ok()
+        if verb == "item":
+            captured.append(cmd)
+            return mock.Mock(returncode=0, stdout="secret-value\n", stderr="")
+        raise AssertionError(f"unexpected verb: {verb!r}")
+
+    _patch_run(monkeypatch, fake_run)
+
+    secrets, warnings = pp.fetch_protonpass_secrets(
+        service_token="svc",
+        env_refs={"K": f"pass://{share_id}/{item_id}/field"},
+        binary=binary,
+        use_cache=False,
+        home_path=hermes_home,
+    )
+    assert secrets == {"K": "secret-value"}
+    assert warnings == []
+    assert captured == [
+        [str(binary), "item", "view", "--", f"pass://{share_id}/{item_id}/field"]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +892,13 @@ def test_mode_b_non_ascii_env_name_rejected(hermes_home, monkeypatch, tmp_path):
 def test_is_valid_share_or_item_id():
     assert pp_fetch._is_valid_share_or_item_id("AbC_-123")
     assert pp_fetch._is_valid_share_or_item_id("_leading")
-    assert not pp_fetch._is_valid_share_or_item_id("-leading-dash")
+    # V-DASH (regression): a leading '-' is a legitimate base64url ID byte —
+    # real Proton IDs start with it roughly 1-in-64 of the time. It is not
+    # rejected because share_id/item_id are never standalone argv tokens;
+    # _fetch_refs embeds them as f"pass://{share_id}/{item_id}/{field}" after
+    # a "--" terminator, so a leading '-' inside the ID can't be misread as
+    # a flag at this call site.
+    assert pp_fetch._is_valid_share_or_item_id("-leading-dash")
     assert not pp_fetch._is_valid_share_or_item_id("")
     assert not pp_fetch._is_valid_share_or_item_id("has/slash")
     assert not pp_fetch._is_valid_share_or_item_id("x" * (pp_fetch._MAX_ID_LEN + 1))
