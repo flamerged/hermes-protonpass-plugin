@@ -78,3 +78,31 @@ jobs:
 
       - name: Check upstream compatibility (advisory)
         run: hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests"
+
+  windows-session-lock:
+    runs-on: windows-latest
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install standalone test dependencies
+        run: |
+          uv venv --python 3.11
+          uv pip install --python .venv/Scripts/python.exe pytest==8.3.5
+
+      - name: Test native Windows session locking
+        shell: pwsh
+        run: |
+          # Keep pytest outside the directory-install shim's package tree.
+          $lockTestPython = (Resolve-Path .venv/Scripts/python.exe).Path
+          $lockTestRoot = Join-Path $env:RUNNER_TEMP ("protonpass-lock-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path "$lockTestRoot/tests", "$lockTestRoot/hermes_protonpass/source" -Force | Out-Null
+          Copy-Item tests/test_protonpass_locking.py "$lockTestRoot/tests/test_protonpass_locking.py"
+          Copy-Item hermes_protonpass/source/locking.py "$lockTestRoot/hermes_protonpass/source/locking.py"
+          Set-Location $lockTestRoot
+          & $lockTestPython -m pytest tests/test_protonpass_locking.py

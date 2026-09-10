@@ -19,8 +19,9 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .cache import (
     _CACHE,
@@ -36,11 +37,13 @@ from .config import (
 )
 from .install import find_pass_cli
 from .session import (
+    _SessionRecovery,
     _child_env,
     _clean_stream,
     _establish_session,
     _redact_token,
     _run_pass_cli,
+    _session_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +94,47 @@ def _cli_error_detail(proc, token: str, *, limit: int = 200) -> str:
     return err[:limit] if err else "(no stderr output)"
 
 
+# Verified in pass-cli 2.1.1 main.rs (8e6b653): missing authentication and
+# invalidated sessions. Item/local-key errors can have unrelated causes.
+_LOST_SESSION_MARKERS = (
+    "this operation requires an authenticated client",
+    "your session has been invalidated and you have been logged out automatically.",
+)
+
+
+def _run_with_session_recovery(
+    cmd: List[str],
+    env: Dict[str, str],
+    *,
+    token: str,
+    binary: Path,
+    recovery: _SessionRecovery,
+    warnings: List[str],
+):
+    """Retry a verified lost-session failure once under the caller's lock.
+
+    The allowance belongs to the entire transaction, not to each ref. Never
+    inspect secret-bearing stdout or include argv/credentials in diagnostics.
+    """
+    proc = _run_pass_cli(cmd, env)
+    if proc is None or proc.returncode == 0:
+        return proc
+    error = _clean_stream(proc.stderr or "").lower()
+    if not any(marker in error for marker in _LOST_SESSION_MARKERS):
+        return proc
+    if not recovery.claim():
+        return proc
+    _run_pass_cli([str(binary), "logout", "--force"], env)
+    try:
+        _establish_session(token, binary, recovery=recovery)
+    except RuntimeError:
+        # Preserve the original failed command for the caller's redacted
+        # warning and partial-result cache suppression.
+        return proc
+    warnings.append("pass-cli session recovered during secret retrieval")
+    return _run_pass_cli(cmd, env)
+
+
 def _drop_bootstrap(
     secrets: Dict[str, str], bootstrap_names: Iterable[str]
 ) -> Dict[str, str]:
@@ -106,6 +150,19 @@ def _drop_bootstrap(
     if not drop:
         return secrets
     return {k: v for k, v in secrets.items() if k not in drop}
+
+
+def _read_cached_secrets(cache_key, ttl, home_path, bootstrap_names):
+    cached = _CACHE.get(cache_key)
+    if cached and cached.is_fresh(ttl):
+        return _drop_bootstrap(cached.secrets, bootstrap_names)
+    disk_cached = _read_disk_cache(cache_key, ttl, home_path)
+    if disk_cached is None:
+        return None
+    dropped = _drop_bootstrap(disk_cached.secrets, bootstrap_names)
+    # Never promote protected keys, including those from legacy entries.
+    _CACHE[cache_key] = _CachedFetch(dropped, disk_cached.fetched_at)
+    return dropped
 
 
 def fetch_protonpass_secrets(
@@ -192,17 +249,11 @@ def fetch_protonpass_secrets(
 
     cache_key = build_cache_key(service_token, vault, env_refs, home_path)
     if use_cache:
-        cached = _CACHE.get(cache_key)
-        if cached and cached.is_fresh(cache_ttl_seconds):
-            return _drop_bootstrap(cached.secrets, bootstrap_names), list(warnings)
-        # L2: disk cache. Cheap read vs re-establishing a session + fetching.
-        disk_cached = _read_disk_cache(cache_key, cache_ttl_seconds, home_path)
-        if disk_cached is not None:
-            dropped = _drop_bootstrap(disk_cached.secrets, bootstrap_names)
-            # Promote a bootstrap-dropped copy so the in-process cache never
-            # holds a protected key, even from a legacy disk entry.
-            _CACHE[cache_key] = _CachedFetch(dropped, disk_cached.fetched_at)
-            return dropped, list(warnings)
+        cached = _read_cached_secrets(
+            cache_key, cache_ttl_seconds, home_path, bootstrap_names
+        )
+        if cached is not None:
+            return cached, list(warnings)
 
     # Honor auto_install: when False we never download — only an existing
     # managed copy or a SHA-256-verified PATH binary is used.
@@ -216,60 +267,82 @@ def fetch_protonpass_secrets(
             "of automatic downloads)."
         )
 
-    warnings.extend(_establish_session(service_token, pass_cli))
-
-    secrets: Dict[str, str] = {}
-    # Each fetch leg reports its own retry-worthy incompleteness via
-    # _FetchResult.cache_blockers; we sum them and cache only a clean (zero)
-    # result.  MODE A first so MODE B can override on collision.
-    cache_blockers = 0
-
-    if vault:
-        a = _fetch_vault(pass_cli, service_token, vault)
-        secrets.update(a.secrets)
-        warnings.extend(a.warnings)
-        cache_blockers += a.cache_blockers
-
-    if env_refs:
-        b = _fetch_refs(pass_cli, service_token, env_refs)
-        secrets.update(b.secrets)  # MODE B precedence
-        warnings.extend(b.warnings)
-        cache_blockers += b.cache_blockers
-
-    # MODE A leak fix: a vault item whose DERIVED env name equals ANY protected
-    # bootstrap name must never be written to the plaintext disk cache nor
-    # returned (the planner refuses to apply it, but it would otherwise leak into
-    # the cache file / result.secrets).  Drop every protected name here, BEFORE
-    # the cache write.  Sorted for a deterministic warning order.
-    for name in sorted(bootstrap_names):
-        removed = secrets.pop(name, None)
-        if removed is not None:
-            warnings.append(
-                f"Skipping fetched value for {name!r}: it matches the "
-                "bootstrap service-token env var and is never cached or applied."
+    # The same owner spans establishment, every fetch leg, recovery and cache
+    # publication. pass-cli can clean up its session even during an item read.
+    with _session_lock(service_token):
+        if use_cache:
+            # Another process may have completed this exact fetch while we
+            # waited. Re-check before issuing any login or item commands.
+            cached = _read_cached_secrets(
+                cache_key, cache_ttl_seconds, home_path, bootstrap_names
             )
+            if cached is not None:
+                return cached, list(warnings)
 
-    # An empty combined result that ALSO produced warnings is a recoverable
-    # hiccup, not an intentional empty success — don't freeze it for the TTL.
-    if not secrets and warnings:
-        cache_blockers += 1
+        recovery = _SessionRecovery()
+        warnings.extend(_establish_session(service_token, pass_cli, recovery=recovery))
+        run = partial(
+            _run_with_session_recovery,
+            token=service_token,
+            binary=pass_cli,
+            recovery=recovery,
+            warnings=warnings,
+        )
 
-    # Cache only a clean, complete result.  cache_blockers > 0 means some leg saw
-    # a retry-worthy incompleteness (a transient/empty ref, a glitched vault, an
-    # all-empty+warning result).  ttl<=0 disables BOTH layers ("always refetch").
-    caching_enabled = use_cache and cache_ttl_seconds > 0 and cache_blockers == 0
+        secrets: Dict[str, str] = {}
+        # Each fetch leg reports its own retry-worthy incompleteness via
+        # _FetchResult.cache_blockers; we sum them and cache only a clean (zero)
+        # result.  MODE A first so MODE B can override on collision.
+        cache_blockers = 0
 
-    if caching_enabled:
-        entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
-        _CACHE[cache_key] = entry
-        _write_disk_cache(cache_key, entry, cache_ttl_seconds, home_path)
-    return secrets, warnings
+        if vault:
+            a = _fetch_vault(pass_cli, service_token, vault, run=run)
+            secrets.update(a.secrets)
+            warnings.extend(a.warnings)
+            cache_blockers += a.cache_blockers
+
+        if env_refs:
+            b = _fetch_refs(pass_cli, service_token, env_refs, run=run)
+            secrets.update(b.secrets)  # MODE B precedence
+            warnings.extend(b.warnings)
+            cache_blockers += b.cache_blockers
+
+        # MODE A leak fix: a vault item whose DERIVED env name equals ANY protected
+        # bootstrap name must never be written to the plaintext disk cache nor
+        # returned (the planner refuses to apply it, but it would otherwise leak into
+        # the cache file / result.secrets).  Drop every protected name here, BEFORE
+        # the cache write.  Sorted for a deterministic warning order.
+        for name in sorted(bootstrap_names):
+            removed = secrets.pop(name, None)
+            if removed is not None:
+                warnings.append(
+                    f"Skipping fetched value for {name!r}: it matches the "
+                    "bootstrap service-token env var and is never cached or applied."
+                )
+
+        # An empty combined result that ALSO produced warnings is a recoverable
+        # hiccup, not an intentional empty success — don't freeze it for the TTL.
+        if not secrets and warnings:
+            cache_blockers += 1
+
+        # Cache only a clean, complete result.  cache_blockers > 0 means some leg saw
+        # a retry-worthy incompleteness (a transient/empty ref, a glitched vault, an
+        # all-empty+warning result).  ttl<=0 disables BOTH layers ("always refetch").
+        caching_enabled = use_cache and cache_ttl_seconds > 0 and cache_blockers == 0
+
+        if caching_enabled:
+            entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
+            _CACHE[cache_key] = entry
+            _write_disk_cache(cache_key, entry, cache_ttl_seconds, home_path)
+        return secrets, warnings
 
 
 def _fetch_refs(
     binary: Path,
     token: str,
     env_refs: Dict[str, str],
+    *,
+    run: Optional[Callable] = None,
 ) -> _FetchResult:
     """MODE B: resolve each ``ENV_VAR -> pass://...`` ref to a single value.
 
@@ -350,7 +423,7 @@ def _fetch_refs(
             "--",
             item_uri,
         ]
-        proc = _run_pass_cli(cmd, env)
+        proc = (run or _run_pass_cli)(cmd, env)
         if proc is None:
             warnings.append(
                 f"Skipping ref {env_name!r}: pass-cli timed out or failed to invoke"
@@ -427,6 +500,8 @@ def _fetch_vault(
     binary: Path,
     token: str,
     vault: str,
+    *,
+    run: Optional[Callable] = None,
 ) -> _FetchResult:
     """MODE A: list a vault's items and map their fields to env vars.
 
@@ -461,7 +536,7 @@ def _fetch_vault(
         vault,
     ]
     env = _child_env(token)
-    proc = _run_pass_cli(cmd, env)
+    proc = (run or _run_pass_cli)(cmd, env)
     if proc is None:
         return _FetchResult(
             {},
