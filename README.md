@@ -88,6 +88,14 @@ hermes protonpass disable
 hermes protonpass install
 ```
 
+## Bundled skill
+
+The plugin bundles a `vault-access` skill (`skill_view("protonpass:vault-access")`)
+for mapping existing item references in `config.yaml` and diagnosing resolution with
+`hermes protonpass status` and `sync`. It works with repository and Python package
+installs. Users obtain missing IDs in their own authenticated Proton Pass CLI session;
+the skill does not enumerate vaults, display secrets, or request bootstrap tokens.
+
 ## Development
 
 Run the test suite through a Hermes Agent checkout's canonical runner:
@@ -97,8 +105,13 @@ cd /path/to/hermes-agent
 uv sync --python 3.11 --extra dev
 uv pip install --python .venv/bin/python --no-deps \
   -e /path/to/hermes-protonpass-plugin
-scripts/run_tests.sh /path/to/hermes-protonpass-plugin/tests -q
+scripts/run_tests.sh /path/to/hermes-protonpass-plugin/tests
 ```
 
 Tests are hermetic: they use temporary Hermes homes and mocked subprocess or
 download boundaries. No live Proton account is required.
+
+CI also builds the wheel and source distribution, installs each into a separate
+environment with Hermes 0.18.2 and dependency resolution, and runs
+`scripts/check_installed_plugin.py` from outside the checkout. This checks the real
+entry point and skill loading from `site-packages`, including the bundled resource.

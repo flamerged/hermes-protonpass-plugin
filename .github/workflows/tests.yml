@@ -36,14 +36,49 @@ jobs:
 
       - name: Lint
         run: |
-          hermes-agent/.venv/bin/ruff check hermes_protonpass tests
-          hermes-agent/.venv/bin/ruff format --check hermes_protonpass tests
+          hermes-agent/.venv/bin/ruff check hermes_protonpass tests scripts
+          hermes-agent/.venv/bin/ruff format --check hermes_protonpass tests scripts
 
       - name: Test
         run: hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests"
 
       - name: Build package
         run: uv build
+
+  installed-package:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        distribution: [wheel, sdist]
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Build distributions
+        run: uv build --python 3.11 --out-dir "$RUNNER_TEMP/dist"
+
+      - name: Install and verify ${{ matrix.distribution }} outside the checkout
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          if [[ "$DISTRIBUTION" == "wheel" ]]; then
+            artifacts=("$RUNNER_TEMP"/dist/*.whl)
+          else
+            artifacts=("$RUNNER_TEMP"/dist/*.tar.gz)
+          fi
+          [[ ${#artifacts[@]} -eq 1 && -f "${artifacts[0]}" ]]
+          uv venv --python 3.11 "$RUNNER_TEMP/installed-venv"
+          uv pip install --python "$RUNNER_TEMP/installed-venv/bin/python" \
+            "hermes-agent==0.18.2" "${artifacts[0]}"
+          uv pip check --python "$RUNNER_TEMP/installed-venv/bin/python"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/installed-venv/bin/python" -I \
+            "$GITHUB_WORKSPACE/scripts/check_installed_plugin.py" "${artifacts[0]}"
 
   upstream-compatibility:
     # Observe upstream changes without silently expanding our supported range.

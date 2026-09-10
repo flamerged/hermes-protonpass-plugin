@@ -1,3 +1,4 @@
 include __init__.py
 include plugin.yaml
+include scripts/check_installed_plugin.py
 recursive-include tests *.py
